@@ -22,7 +22,12 @@ import os
 import sys
 import json
 import argparse
+import warnings
 from pathlib import Path
+
+# ─── 静默 pypdfium2 的 FontBBox 警告（不影响输出） ───
+warnings.filterwarnings("ignore", message="Could not get FontBBox")
+warnings.filterwarnings("ignore", message=".*FontBBox.*")
 
 # ─── 配置 ───────────────────────────────────────────────
 # 输出目录（可改 DOC2MD_OUTPUT 环境变量）
@@ -173,10 +178,10 @@ def convert(input_path: str, force: bool = False) -> bool:
             # 走标准 markitdown 转换
             md = MarkItDown()
             result = md.convert(input_path)
-            if result and result.text_content and len(result.text_content) > 100:
+            if result and len(result.text_content) > 0:
                 output_path.write_text(result.text_content, encoding="utf-8")
             else:
-                print(f"  {Color.YELLOW}⚠ 输出过短或无内容: {label}{Color.NC}")
+                print(f"  {Color.YELLOW}⚠ 输出为空或过短: {label}{Color.NC}")
                 return False
 
         size = output_path.stat().st_size
