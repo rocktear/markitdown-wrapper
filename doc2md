@@ -1,0 +1,306 @@
+#!/usr/bin/env python3
+"""
+doc2md — 万能文档→Markdown 转换器
+
+将 PDF/DOCX/PPTX/XLSX/图片/音频/视频/网页/YouTube/Wikipedia/RSS/ZIP/邮件/Notebook……
+一切可读的东西转为 Markdown，统一输出到固定位置。
+
+用法:
+  doc2md <文件路径 | URL>...
+  doc2md paper.pdf                        # PDF 论文
+  doc2md photo.jpg                        # 图片（含 LLM 描述）
+  doc2md recording.mp3                    # 音频转录
+  doc2md "https://youtu.be/xxxx"          # YouTube 字幕
+  doc2md "https://en.wikipedia.org/..."   # Wikipedia 文章
+  doc2md archive.zip                      # 压缩包递归
+  doc2md --help                           # 完整帮助
+
+输出目录: ~/Documents/wiki/playbook/raw/
+"""
+
+import os
+import sys
+import json
+import argparse
+from pathlib import Path
+
+# ─── 配置 ───────────────────────────────────────────────
+# 输出目录（可改 DOC2MD_OUTPUT 环境变量）
+OUTPUT_BASE = Path(os.environ.get("DOC2MD_OUTPUT", str(Path.home() / "Documents" / "wiki" / "playbook" / "raw")))
+
+# LLM 图片描述 —— 完全由环境变量控制，不设默认值。
+# 设了就启用，不设就走 markitdown 原生行为（仅 EXIF 元数据）。
+LLM_BASE_URL = os.environ.get("OPENAI_BASE_URL")
+LLM_API_KEY = os.environ.get("OPENAI_API_KEY")
+LLM_MODEL = os.environ.get("DOC2MD_LLM_MODEL", "gpt-4o")
+LLM_IMAGE_PROMPT = os.environ.get(
+    "DOC2MD_IMAGE_PROMPT",
+    "Describe this image in detail, including objects, scene, colors, and any visible text.",
+)
+
+
+# ─── 颜色 ───────────────────────────────────────────────
+class Color:
+    RED = "\033[0;31m"
+    GREEN = "\033[0;32m"
+    YELLOW = "\033[1;33m"
+    BLUE = "\033[0;34m"
+    CYAN = "\033[0;36m"
+    NC = "\033[0m"
+
+
+# ─── 判断图片格式 ──────────────────────────────────────
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tiff", ".tif"}
+AUDIO_EXTENSIONS = {".mp3", ".wav", ".aiff", ".flac", ".m4a", ".ogg"}
+URL_PREFIXES = ("http://", "https://")
+YOUTUBE_DOMAINS = ("youtube.com", "youtu.be", "m.youtube.com")
+
+
+def is_image(path: str) -> bool:
+    return Path(path).suffix.lower() in IMAGE_EXTENSIONS
+
+
+def is_audio(path: str) -> bool:
+    return Path(path).suffix.lower() in AUDIO_EXTENSIONS
+
+
+def is_url(path: str) -> bool:
+    return path.startswith(URL_PREFIXES)
+
+
+def is_youtube(url: str) -> bool:
+    from urllib.parse import urlparse
+    return any(d in urlparse(url).netloc for d in YOUTUBE_DOMAINS)
+
+
+# ─── LLM 图片描述 ──────────────────────────────────────
+def describe_image_with_llm(image_path: str) -> str | None:
+    """用 LLM 生成图片描述。需要 API key。"""
+    if not LLM_API_KEY:
+        return None
+
+    try:
+        from openai import OpenAI
+
+        client = OpenAI(base_url=LLM_BASE_URL, api_key=LLM_API_KEY)
+
+        import base64
+        with open(image_path, "rb") as f:
+            b64 = base64.b64encode(f.read()).decode("utf-8")
+
+        # 猜 MIME
+        ext = Path(image_path).suffix.lower().lstrip(".")
+        mime_map = {
+            "jpg": "image/jpeg", "jpeg": "image/jpeg",
+            "png": "image/png", "gif": "image/gif",
+            "webp": "image/webp", "bmp": "image/bmp",
+        }
+        mime = mime_map.get(ext, "image/png")
+        data_uri = f"data:{mime};base64,{b64}"
+
+        response = client.chat.completions.create(
+            model=LLM_MODEL,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": LLM_IMAGE_PROMPT},
+                    {"type": "image_url", "image_url": {"url": data_uri}},
+                ],
+            }],
+            max_tokens=1024,
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        print(f"  {Color.YELLOW}⚠ LLM 描述失败: {e}{Color.NC}", file=sys.stderr)
+        return None
+
+
+# ─── 输出文件名 ────────────────────────────────────────
+def make_output_name(input_path: str) -> str:
+    if is_url(input_path):
+        from urllib.parse import urlparse
+        parsed = urlparse(input_path)
+        name = (parsed.netloc + parsed.path).replace("/", "_").replace("?", "_")
+        name = name.strip("_")
+        if len(name) > 80:
+            name = name[:80]
+        return name + ".md"
+
+    p = Path(input_path)
+    return p.stem + ".md"
+
+
+# ─── 转换核心 ──────────────────────────────────────────
+def convert(input_path: str, force: bool = False) -> bool:
+    """转换一个文件/URL，返回成功与否。"""
+    from markitdown import MarkItDown
+
+    output_name = make_output_name(input_path)
+    output_path = OUTPUT_BASE / output_name
+
+    # 已存在跳过
+    if output_path.exists() and not force:
+        print(f"  {Color.BLUE}• 已存在，跳过（FORCE=1 覆盖）: {output_name}{Color.NC}")
+        return True
+
+    label = Path(input_path).name if not is_url(input_path) else input_path
+    print(f"  {Color.GREEN}→ {label}{Color.NC}")
+
+    try:
+        # 图片走 LLM 描述增强
+        if is_image(input_path) and LLM_API_KEY:
+            md_content = []
+
+            # 先拿 EXIF 元数据
+            md = MarkItDown()
+            result = md.convert(input_path)
+            if result and result.text_content:
+                md_content.append(result.text_content)
+
+            # 再加 LLM 描述
+            desc = describe_image_with_llm(input_path)
+            if desc:
+                md_content.append(f"\n## LLM 描述\n\n{desc}")
+
+            if md_content:
+                text = "\n".join(md_content)
+                output_path.write_text(text, encoding="utf-8")
+            else:
+                print(f"  {Color.YELLOW}⚠ 图片处理无输出: {label}{Color.NC}")
+                return False
+
+        else:
+            # 走标准 markitdown 转换
+            md = MarkItDown()
+            result = md.convert(input_path)
+            if result and result.text_content and len(result.text_content) > 100:
+                output_path.write_text(result.text_content, encoding="utf-8")
+            else:
+                print(f"  {Color.YELLOW}⚠ 输出过短或无内容: {label}{Color.NC}")
+                return False
+
+        size = output_path.stat().st_size
+        lines = len(output_path.read_text(encoding="utf-8").splitlines())
+        print(f"  {Color.GREEN}✓ {output_name} ({_fmt_size(size)}, {lines} 行){Color.NC}")
+        return True
+
+    except Exception as e:
+        print(f"  {Color.RED}✗ 失败: {label} — {e}{Color.NC}")
+        if output_path.exists():
+            output_path.unlink()
+        return False
+
+
+def _fmt_size(bytes: int) -> str:
+    for unit in ("B", "KB", "MB"):
+        if bytes < 1024:
+            return f"{bytes}{unit}"
+        bytes /= 1024
+    return f"{bytes:.1f}GB"
+
+
+# ─── 帮助 ──────────────────────────────────────────────
+def print_help():
+    print("""用法: doc2md <文件路径 | URL>... [选项]
+
+===== 文件类 =====
+  .pdf       — PDF 论文/报告/书籍（含表格提取）
+  .docx      — Word 文档
+  .pptx      — 课件/演示文稿
+  .xlsx/.xls — Excel 表格（多 sheet）
+  .html      — 网页
+  .csv       — 表格数据
+  .json/xml  — 结构化数据
+  .ipynb     — Jupyter Notebook
+  .msg       — Outlook 邮件
+  .epub      — 电子书
+
+===== 非结构化 =====
+  .jpg/.png/.gif — 图片（EXIF + LLM 描述 *）
+  .mp3/.wav      — 音频（语音转文字）
+
+===== 网络 =====
+  YouTube URL       — 视频字幕提取
+  Wikipedia URL     — Wikipedia 文章
+  RSS/Atom URL      — 订阅源
+  Bing 搜索 URL     — 搜索结果
+
+===== 打包 =====
+  .zip — 压缩包（递归解压处理）
+
+* LLM 图片描述（需设置环境变量）:
+  必填: OPENAI_API_KEY=xxx
+  可选: OPENAI_BASE_URL=xxx     [默认: https://api.openai.com/v1]
+         DOC2MD_LLM_MODEL=xxx   [默认: gpt-4o]
+         DOC2MD_IMAGE_PROMPT=xxx [自定义描述提示词]
+  示例: OPENAI_API_KEY=sk-xxx doc2md photo.jpg
+
+输出目录（可配置）:
+  默认: ~/Documents/wiki/playbook/raw/
+  自定: DOC2MD_OUTPUT=~/output doc2md paper.pdf
+
+选项:
+  --force, -f    覆盖已存在的输出
+  --help, -h     显示此帮助
+
+示例:
+  doc2md paper.pdf                         # 论文
+  doc2md photo.jpg                         # 图片+LLM描述
+  doc2md *.pdf ~/Downloads/*.docx          # 批量
+  doc2md paper.jpg "https://youtu.be/..."  # 混合
+  FORCE=1 doc2md paper.pdf                 # 覆盖
+""".strip())
+
+
+# ─── 主入口 ────────────────────────────────────────────
+def main():
+    # 解析参数
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("items", nargs="*", help="Files or URLs to convert")
+    parser.add_argument("--force", "-f", action="store_true", help="Overwrite existing")
+    parser.add_argument("--help", "-h", action="store_true", help="Show help")
+    args, _ = parser.parse_known_args()
+
+    if args.help or not args.items:
+        print_help()
+        sys.exit(0)
+
+    force = args.force or os.environ.get("FORCE") == "1"
+
+    # 确保输出目录存在
+    OUTPUT_BASE.mkdir(parents=True, exist_ok=True)
+
+    print(f"{Color.BLUE}╔{'═' * 40}╗{Color.NC}")
+    print(f"{Color.BLUE}║   doc2md — 万能→Markdown 引擎        ║{Color.NC}")
+    if LLM_API_KEY:
+        print(f"{Color.BLUE}║   LLM 描述: {LLM_MODEL}{' ' * (28 - len(LLM_MODEL))}║{Color.NC}")
+    print(f"{Color.BLUE}║   输出 → {OUTPUT_BASE}{Color.NC}")
+    print(f"{Color.BLUE}╚{'═' * 40}╝{Color.NC}")
+    print()
+
+    items = args.items
+    total = len(items)
+    success = 0
+    failed = 0
+
+    for item in items:
+        total_processed = success + failed + 1
+        print(f"  [{total_processed}/{total}] ", end="")
+        if convert(item, force=force):
+            success += 1
+        else:
+            failed += 1
+
+    print()
+    print(f"{Color.BLUE}┌{'─' * 40}┐{Color.NC}")
+    print(f"{Color.BLUE}│ 总计: {total}  │  ✓ {success}  │  ✗ {failed}               │{Color.NC}")
+    print(f"{Color.BLUE}└{'─' * 40}┘{Color.NC}")
+
+    if success > 0:
+        print()
+        print(f"{Color.CYAN}💡 转换完成！建议:{Color.NC}")
+        print("   qmd update   # 更新 wiki 索引")
+
+
+if __name__ == "__main__":
+    main()
